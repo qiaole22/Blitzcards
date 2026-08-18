@@ -20,6 +20,12 @@ account, no server, no ads. Everything runs and stays on your own device.
   come in grouped the same way, collapsible in the library view.
 - **Or start from scratch** — add cards by hand, front and back, into any
   deck, at any time, no import required.
+- **Study across decks, or leave some out** — tap the checkbox icon in the
+  library to select any combination of decks (or a whole group, like all of
+  HSK, with one tap) and study them together in a single session, in random
+  or sequential order.
+- **Remove decks** — the same selection mode lets you delete decks (and all
+  their cards) you no longer need.
 - **A real spaced-repetition schedule** — new cards move through short
   learning steps, then graduate into a day-scale review cycle (the same
   family of algorithm Anki itself uses), adjusting per card based on how

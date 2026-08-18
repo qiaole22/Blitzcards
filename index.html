@@ -95,6 +95,23 @@
   }
   .drawer .addbtn:active{background:var(--paper);}
 
+  .drawer.selectable{padding:18px 52px 16px 18px; transition:background .1s ease, border-color .1s ease;}
+  .drawer.selectable.selected{background:#F1EAD8; border-color:var(--brass);}
+  .drawer .checkmark{
+    position:absolute; right:16px; top:50%; transform:translateY(-50%);
+    width:26px; height:26px; border-radius:50%; border:1.5px solid var(--brass);
+    color:var(--card); background:var(--brass); font-size:14px; font-weight:700;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .drawer.selectable:not(.selected) .checkmark{background:transparent; color:transparent;}
+  .checkmark.sm{
+    width:18px; height:18px; border-radius:5px; border:1.5px solid var(--brass);
+    background:transparent; color:transparent; font-size:11px; font-weight:700; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center; cursor:pointer;
+  }
+  .checkmark.sm.checked{background:var(--brass); color:var(--card);}
+  .iconbtn.active{background:var(--ink); color:var(--card); border-color:var(--ink);}
+
   .empty{
     text-align:center; padding:60px 20px; color:var(--ink-soft);
   }
@@ -154,6 +171,15 @@
     color:var(--ink-soft); font-size:12.5px; text-transform:uppercase; letter-spacing:0.1em;
     background:var(--card);
   }
+
+  .selectbar{display:flex; flex-direction:column; gap:10px; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; box-shadow:var(--shadow);}
+  .ordertoggle{display:flex; background:var(--paper); border-radius:8px; padding:3px; gap:3px;}
+  .ordertoggle button{
+    flex:1; border:none; background:transparent; color:var(--ink-soft); padding:8px; border-radius:6px;
+    font-family:'IBM Plex Sans'; font-weight:600; font-size:12.5px; cursor:pointer;
+  }
+  .ordertoggle button.active{background:var(--ink); color:var(--card);}
+  .deletebtn{color:var(--rust); border-color:var(--rust);}
 
   .done{text-align:center; padding:60px 20px;}
   .done .display{font-size:26px; margin-bottom:8px;}
@@ -297,7 +323,8 @@ function newCardState() {
     interval: 0,        // days (once in review)
     reps: 0,
     lapses: 0,
-    due: Date.now()
+    due: Date.now(),
+    createdAt: Date.now()
   };
 }
 
@@ -487,18 +514,60 @@ async function importApkg(file, onProgress) {
 
   onProgress('Saving to your library…');
   const deckIds = Object.keys(importedByDeck);
-  let totalCards = 0;
-  for (const did of deckIds) {
+
+  // Work out how each Anki deck should map to a name + optional group.
+  // Two cases:
+  //  1. True Anki subdecks, named "Parent::Child" (e.g. "HSK::HSK 1").
+  //  2. Flat sibling decks that just share a text prefix before a trailing
+  //     number (e.g. "HSK 1", "HSK 2", "HSK 3") — how most downloaded HSK
+  //     packs are actually structured, with no "::" at all.
+  const deckMetas = deckIds.map(did => {
     const ankiDeck = ankiDecks[did];
-    // Anki names subdecks "Parent::Child" — e.g. "HSK::HSK 1", "HSK::HSK 2".
-    // Preserve that split so the library groups them the same way Anki does,
-    // instead of flattening everything to the last segment.
-    const parts = ankiDeck ? ankiDeck.name.split('::').filter(Boolean) : ['Imported deck'];
-    const group = parts.length > 1 ? parts[0] : null;
-    const name = parts.length > 1 ? parts.slice(1).join(' › ') : parts[0];
+    const rawName = ankiDeck ? ankiDeck.name : 'Imported deck';
+    const parts = rawName.split('::').filter(Boolean);
+    return { did, parts };
+  });
+
+  const prefixCounts = {};
+  const prefixCasing = {};
+  for (const m of deckMetas) {
+    if (m.parts.length > 1) continue; // already grouped via ::
+    const match = m.parts[0].match(/^(.*?)[\s\-_]+(\d+)$/);
+    if (match) {
+      const prefix = match[1].trim();
+      if (prefix.length >= 2) {
+        const key = prefix.toLowerCase();
+        prefixCounts[key] = (prefixCounts[key] || 0) + 1;
+        if (!prefixCasing[key]) prefixCasing[key] = prefix;
+      }
+    }
+  }
+
+  for (const m of deckMetas) {
+    if (m.parts.length > 1) {
+      m.group = m.parts[0];
+      m.name = m.parts.slice(1).join(' › ');
+      continue;
+    }
+    const leaf = m.parts[0];
+    const match = leaf.match(/^(.*?)[\s\-_]+(\d+)$/);
+    if (match) {
+      const key = match[1].trim().toLowerCase();
+      if (prefixCounts[key] >= 2) {
+        m.group = prefixCasing[key];
+        m.name = leaf;
+        continue;
+      }
+    }
+    m.group = null;
+    m.name = leaf;
+  }
+
+  let totalCards = 0;
+  for (const m of deckMetas) {
     const deckId = 'd_' + crypto.randomUUID();
-    await idbPut('decks', { id: deckId, name, group, createdAt: Date.now() });
-    for (const c of importedByDeck[did]) {
+    await idbPut('decks', { id: deckId, name: m.name, group: m.group, createdAt: Date.now() });
+    for (const c of importedByDeck[m.did]) {
       const card = {
         id: 'c_' + crypto.randomUUID(),
         deckId,
@@ -517,12 +586,16 @@ async function importApkg(file, onProgress) {
 const state = {
   view: 'library',
   decks: [],
-  studyDeckId: null,
+  studyDeckIds: [],
+  studyOrder: 'random', // 'random' | 'sequential'
   queue: [],
   currentIndex: 0,
   revealed: false,
   editingCard: null,
-  toastMsg: null
+  toastMsg: null,
+  selectMode: false,
+  selectedDecks: new Set(),
+  collapsedGroups: new Set()
 };
 
 function showToast(msg) {
@@ -545,17 +618,41 @@ async function refreshDecks() {
   state.decks = withStats;
 }
 
-async function startStudy(deckId) {
-  const cards = await idbGetByIndex('cards', 'deckId', deckId);
-  const now = Date.now();
-  const due = cards.filter(c => c.state !== 'new' && c.due <= now);
-  const fresh = cards.filter(c => c.state === 'new').slice(0, 20);
-  const queue = [...due, ...fresh].sort(() => Math.random() - 0.35);
-  state.studyDeckId = deckId;
+async function deleteDecks(deckIds) {
+  for (const deckId of deckIds) {
+    const cards = await idbGetByIndex('cards', 'deckId', deckId);
+    for (const c of cards) await idbDelete('cards', c.id);
+    await idbDelete('decks', deckId);
+  }
+}
+
+async function startStudy(deckIds, order) {
+  order = order || state.studyOrder || 'random';
+  let allDue = [], allFresh = [];
+  for (const deckId of deckIds) {
+    const cards = await idbGetByIndex('cards', 'deckId', deckId);
+    const now = Date.now();
+    allDue.push(...cards.filter(c => c.state !== 'new' && c.due <= now));
+    allFresh.push(...cards.filter(c => c.state === 'new'));
+  }
+  let queue;
+  if (order === 'sequential') {
+    allDue.sort((a, b) => a.due - b.due);
+    allFresh.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+    queue = [...allDue, ...allFresh.slice(0, 20 * deckIds.length)];
+  } else {
+    allDue.sort(() => Math.random() - 0.5);
+    allFresh.sort(() => Math.random() - 0.5);
+    queue = [...allDue, ...allFresh.slice(0, 20 * deckIds.length)].sort(() => Math.random() - 0.35);
+  }
+  state.studyDeckIds = deckIds;
+  state.studyOrder = order;
   state.queue = queue;
   state.currentIndex = 0;
   state.revealed = false;
   state.view = 'study';
+  state.selectMode = false;
+  state.selectedDecks = new Set();
   render();
 }
 
@@ -578,6 +675,21 @@ function esc(s) {
 }
 
 function drawerHtml(d) {
+  const selected = state.selectedDecks.has(d.id);
+  if (state.selectMode) {
+    return `
+      <div class="drawer selectable ${selected ? 'selected' : ''}" data-selectdeck="${d.id}">
+        <div class="tab"></div>
+        <h3>${esc(d.name)}</h3>
+        <div class="stats">
+          <span class="stat"><span class="dot due"></span>${d.due} due</span>
+          <span class="stat"><span class="dot new"></span>${d.fresh} new</span>
+          <span class="stat"><span class="dot total"></span>${d.total} total</span>
+        </div>
+        <span class="checkmark">${selected ? '✓' : ''}</span>
+      </div>
+    `;
+  }
   return `
     <div class="drawer" data-deck="${d.id}">
       <div class="tab"></div>
@@ -614,8 +726,8 @@ function renderLibrary() {
   }
 
   // Group decks that came from a subdeck hierarchy (e.g. HSK::HSK 1, HSK::HSK 2)
-  // under their shared parent, same as Anki's own deck tree. Ungrouped decks
-  // render as standalone drawers.
+  // — or that just share a name prefix like "HSK 1"/"HSK 2" — under a shared
+  // header. Ungrouped decks render as standalone drawers.
   const groups = {};
   const loose = [];
   for (const d of state.decks) {
@@ -627,16 +739,17 @@ function renderLibrary() {
     }
   }
 
-  if (!state.collapsedGroups) state.collapsedGroups = new Set();
-
   const groupsHtml = Object.keys(groups).sort().map(gname => {
     const collapsed = state.collapsedGroups.has(gname);
     const members = groups[gname];
     const dueSum = members.reduce((a, d) => a + d.due, 0);
+    const allSelected = state.selectMode && members.every(d => state.selectedDecks.has(d.id));
     return `
       <div class="group">
         <div class="group-header ${collapsed ? 'collapsed' : ''}" data-action="toggle-group" data-group="${esc(gname)}">
-          <div class="tab-sm"></div>
+          ${state.selectMode
+            ? `<span class="checkmark sm ${allSelected ? 'checked' : ''}" data-action="select-group" data-group="${esc(gname)}">${allSelected ? '✓' : ''}</span>`
+            : `<div class="tab-sm"></div>`}
           <h4>${esc(gname)} · ${members.length} decks${dueSum ? ` · ${dueSum} due` : ''}</h4>
           <span class="chev-sm">⌄</span>
         </div>
@@ -649,21 +762,47 @@ function renderLibrary() {
 
   const looseHtml = loose.map(drawerHtml).join('');
 
+  const selCount = state.selectedDecks.size;
+  const selectionBar = state.selectMode ? `
+    <div class="study-actions">
+      <div class="study-actions-inner">
+        ${selCount > 0 ? `
+          <div class="selectbar">
+            <div class="ordertoggle">
+              <button class="${state.studyOrder === 'random' ? 'active' : ''}" data-action="set-order" data-order="random">Random</button>
+              <button class="${state.studyOrder === 'sequential' ? 'active' : ''}" data-action="set-order" data-order="sequential">Sequential</button>
+            </div>
+            <div class="row">
+              <button class="secondarybtn deletebtn" data-action="delete-selected">Delete (${selCount})</button>
+              <button class="primarybtn" data-action="study-selected">Study ${selCount} deck${selCount === 1 ? '' : 's'}</button>
+            </div>
+          </div>
+        ` : `<div class="hintbar">Tap decks to select them</div>`}
+      </div>
+    </div>
+  ` : '';
+
   return `
     <header class="top">
       <div class="word"><b>Catalog</b> / study</div>
-      <button class="iconbtn" data-action="new-deck">+</button>
+      <div style="display:flex; gap:8px;">
+        <button class="iconbtn ${state.selectMode ? 'active' : ''}" data-action="toggle-select">${state.selectMode ? '✕' : '☑'}</button>
+        ${!state.selectMode ? `<button class="iconbtn" data-action="new-deck">+</button>` : ''}
+      </div>
     </header>
-    <main>${groupsHtml}${looseHtml}</main>
-    <nav class="bottom">
-      <button data-action="go-import">↓ Import .apkg</button>
-      <button class="ghost" data-action="new-deck">+ New deck</button>
-    </nav>
+    <main style="${state.selectMode ? 'padding-bottom:170px;' : ''}">${groupsHtml}${looseHtml}</main>
+    ${state.selectMode ? selectionBar : `
+      <nav class="bottom">
+        <button data-action="go-import">↓ Import .apkg</button>
+        <button class="ghost" data-action="new-deck">+ New deck</button>
+      </nav>
+    `}
   `;
 }
 
 function renderStudy() {
-  const deck = state.decks.find(d => d.id === state.studyDeckId);
+  const studiedDecks = state.decks.filter(d => state.studyDeckIds.includes(d.id));
+  const title = studiedDecks.length === 1 ? studiedDecks[0].name : `${studiedDecks.length} decks`;
   const total = state.queue.length;
   const idx = state.currentIndex;
 
@@ -671,13 +810,13 @@ function renderStudy() {
     return `
       <header class="top">
         <button class="iconbtn" data-action="go-library">←</button>
-        <div class="word"><b>${esc(deck ? deck.name : '')}</b></div>
+        <div class="word"><b>${esc(title)}</b></div>
         <span style="width:44px"></span>
       </header>
       <main>
         <div class="done">
           <div class="display">All caught up</div>
-          <p>No more cards due in this deck right now. Come back later — the catalog keeps track.</p>
+          <p>No more cards due right now. Come back later — the catalog keeps track.</p>
         </div>
       </main>
       <nav class="bottom"><button data-action="go-library">Back to catalog</button></nav>
@@ -699,9 +838,9 @@ function renderStudy() {
   return `
     <header class="top">
       <button class="iconbtn" data-action="go-library">←</button>
-      <div class="word"><b>${esc(deck ? deck.name : '')}</b></div>
+      <div class="word"><b>${esc(title)}</b></div>
       <div style="display:flex; gap:8px;">
-        <button class="iconbtn" data-action="add-in-study" title="Add card">+</button>
+        ${studiedDecks.length === 1 ? `<button class="iconbtn" data-action="add-in-study" title="Add card">+</button>` : ''}
         <button class="iconbtn" data-action="edit-current" title="Edit card">✎</button>
       </div>
     </header>
@@ -722,7 +861,7 @@ function renderStudy() {
 function renderEditor() {
   const c = state.editingCard || { front: '', back: '' };
   const isNew = !c.id;
-  const targetDeckId = isNew ? (state.pendingDeckId || state.studyDeckId) : c.deckId;
+  const targetDeckId = isNew ? (state.pendingDeckId || (state.studyDeckIds.length === 1 ? state.studyDeckIds[0] : null)) : c.deckId;
   const targetDeck = state.decks.find(d => d.id === targetDeckId);
   return `
     <header class="top">
@@ -810,13 +949,21 @@ function render() {
 
 function bindEvents() {
   app.querySelectorAll('[data-deck]').forEach(el => {
-    el.addEventListener('click', () => startStudy(el.dataset.deck));
+    el.addEventListener('click', () => startStudy([el.dataset.deck]));
+  });
+  app.querySelectorAll('[data-selectdeck]').forEach(el => {
+    el.addEventListener('click', () => {
+      const id = el.dataset.selectdeck;
+      if (state.selectedDecks.has(id)) state.selectedDecks.delete(id);
+      else state.selectedDecks.add(id);
+      render();
+    });
   });
   app.querySelectorAll('[data-action]').forEach(el => {
     el.addEventListener('click', (e) => {
       // These sit nested inside a clickable drawer/group-header — stop the
       // click from also bubbling up and triggering the parent's own handler.
-      if (el.dataset.action === 'add-to-deck' || el.dataset.action === 'toggle-group') {
+      if (el.dataset.action === 'add-to-deck' || el.dataset.action === 'toggle-group' || el.dataset.action === 'select-group') {
         e.stopPropagation();
       }
       handleAction(el.dataset.action, el.dataset);
@@ -893,7 +1040,7 @@ async function handleAction(action, data) {
   }
   else if (action === 'add-in-study') {
     state.editingCard = null;
-    state.pendingDeckId = state.studyDeckId;
+    state.pendingDeckId = state.studyDeckIds[0] || null;
     state.returnToStudy = true;
     state.view = 'editor';
     render();
@@ -906,10 +1053,39 @@ async function handleAction(action, data) {
     render();
   }
   else if (action === 'toggle-group') {
-    if (!state.collapsedGroups) state.collapsedGroups = new Set();
     if (state.collapsedGroups.has(data.group)) state.collapsedGroups.delete(data.group);
     else state.collapsedGroups.add(data.group);
     render();
+  }
+  else if (action === 'toggle-select') {
+    state.selectMode = !state.selectMode;
+    state.selectedDecks = new Set();
+    render();
+  }
+  else if (action === 'select-group') {
+    const members = state.decks.filter(d => d.group === data.group);
+    const allSelected = members.every(d => state.selectedDecks.has(d.id));
+    members.forEach(d => allSelected ? state.selectedDecks.delete(d.id) : state.selectedDecks.add(d.id));
+    render();
+  }
+  else if (action === 'set-order') {
+    state.studyOrder = data.order;
+    render();
+  }
+  else if (action === 'study-selected') {
+    if (state.selectedDecks.size === 0) return;
+    await startStudy([...state.selectedDecks], state.studyOrder);
+  }
+  else if (action === 'delete-selected') {
+    if (state.selectedDecks.size === 0) return;
+    const count = state.selectedDecks.size;
+    if (!confirm(`Delete ${count} deck${count === 1 ? '' : 's'} and all their cards? This can't be undone.`)) return;
+    await deleteDecks([...state.selectedDecks]);
+    state.selectedDecks = new Set();
+    state.selectMode = false;
+    await refreshDecks();
+    render();
+    showToast(`Deleted ${count} deck${count === 1 ? '' : 's'}.`);
   }
   else if (action === 'cancel-edit') {
     state.view = state.returnToStudy ? 'study' : 'library';
@@ -924,7 +1100,7 @@ async function handleAction(action, data) {
     if (c && c.id) {
       c = { ...c, front, back };
     } else {
-      const targetDeck = state.pendingDeckId || state.studyDeckId || state.decks[0]?.id;
+      const targetDeck = state.pendingDeckId || state.studyDeckIds[0] || state.decks[0]?.id;
       if (!targetDeck) { showToast('Create a deck first.'); return; }
       c = { id: 'c_' + crypto.randomUUID(), deckId: targetDeck, front, back, ...newCardState() };
     }
